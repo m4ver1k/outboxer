@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 
+	"github.com/italolelis/outboxer"
 	"github.com/italolelis/outboxer/lock"
 )
 
@@ -71,6 +73,130 @@ func WithInstance(ctx context.Context, db *sql.DB) (*SQLServer, error) {
 	return &s, nil
 }
 
+// Close closes the db connection
+func (s *SQLServer) Close() error {
+	if err := s.conn.Close(); err != nil {
+		return fmt.Errorf("failed to close connection: %w", err)
+	}
+	return nil
+}
+
+// Add the message to the data store
+func (s *SQLServer) Add(ctx context.Context, evt *outboxer.OutboxMessage) error {
+	query := fmt.Sprintf(`INSERT INTO [%s].[%s] (payload, options, headers) VALUES (@p1, @p2, @p3)`, s.SchemaName, s.EventStoreTable)
+	if _, err := s.conn.ExecContext(ctx, query, evt.Payload, checkBinaryParam(evt.Options), checkBinaryParam(evt.Headers)); err != nil {
+		return fmt.Errorf("failed to insert message into the data store: %w", err)
+	}
+
+	return nil
+}
+
+// AddWithinTx creates a transaction and then tries to execute anything within it
+func (s *SQLServer) AddWithinTx(ctx context.Context, evt *outboxer.OutboxMessage, fn func(outboxer.ExecerContext) error) error {
+	tx, err := s.conn.BeginTx(ctx, &sql.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("transaction start failed: %w", err)
+	}
+
+	err = fn(tx)
+	if err != nil {
+		return err
+	}
+
+	query := fmt.Sprintf(`INSERT INTO [%s].[%s] (payload, options, headers) VALUES (@p1, @p2, @p3)`, s.SchemaName, s.EventStoreTable)
+
+	if _, err := tx.ExecContext(ctx, query, evt.Payload, checkBinaryParam(evt.Options), checkBinaryParam(evt.Headers)); err != nil {
+		tx.Rollback()
+		return fmt.Errorf("failed to insert message into the data store: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("transaction commit failed: %w", err)
+	}
+
+	return nil
+}
+
+//checkBinaryParam is a fix for issue with mssql driver converting nil value in varbinary to nvarchar.
+//https://github.com/denisenkom/go-mssqldb/issues/530
+func checkBinaryParam(p outboxer.DynamicValues) outboxer.DynamicValues {
+	if p == nil {
+		return map[string]interface{}{}
+	}
+	return p
+}
+
+// SetAsDispatched sets one message as dispatched
+func (s *SQLServer) SetAsDispatched(ctx context.Context, id int64) error {
+	query := fmt.Sprintf(`
+UPDATE [%s].[%s]
+SET
+    dispatched = 1,
+    dispatched_at = GETDATE(),
+    options = null,
+	headers = null
+WHERE id = @p1;
+`, s.SchemaName, s.EventStoreTable)
+	if _, err := s.conn.ExecContext(ctx, query, id); err != nil {
+		return fmt.Errorf("failed to set message as dispatched: %w", err)
+	}
+
+	return nil
+}
+
+// Remove removes old messages from the data store
+func (s *SQLServer) Remove(ctx context.Context, dispatchedBefore time.Time, batchSize int32) error {
+	tx, err := s.conn.BeginTx(ctx, &sql.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("transaction start failed: %w", err)
+	}
+
+	q := `
+DELETE FROM [%[1]s].[%[2]s]
+WHERE id IN
+(
+    SELECT TOP %d id
+    FROM %[%[1]s].[%[2]s]
+    WHERE
+        "dispatched" = true AND
+        "dispatched_at" < @p1
+)
+`
+
+	query := fmt.Sprintf(q, s.SchemaName, s.EventStoreTable, batchSize)
+	if _, err := tx.ExecContext(ctx, query, dispatchedBefore); err != nil {
+		tx.Rollback()
+		return fmt.Errorf("failed to remove messages from the data store: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("transaction commit failed: %w", err)
+	}
+
+	return nil
+}
+
+// GetEvents retrieves all the relevant events
+func (s *SQLServer) GetEvents(ctx context.Context, batchSize int32) ([]*outboxer.OutboxMessage, error) {
+	var events []*outboxer.OutboxMessage
+
+	rows, err := s.conn.QueryContext(ctx, fmt.Sprintf("SELECT TOP %d * FROM [%s].[%s] WHERE dispatched = 0", batchSize, s.SchemaName, s.EventStoreTable))
+	if err != nil {
+		return events, fmt.Errorf("failed to get messages from the store: %w", err)
+	}
+
+	for rows.Next() {
+		var e outboxer.OutboxMessage
+		err = rows.Scan(&e.ID, &e.Dispatched, &e.DispatchedAt, &e.Payload, &e.Options, &e.Headers)
+		if err != nil {
+			return events, fmt.Errorf("failed to scan message: %w", err)
+		}
+		events = append(events, &e)
+	}
+
+	return events, nil
+}
+
 // Lock implements explicit locking
 func (s *SQLServer) lock(ctx context.Context) error {
 	if s.isLocked {
@@ -116,6 +242,7 @@ func (s *SQLServer) unlock(ctx context.Context) error {
 	s.isLocked = false
 	return nil
 }
+
 func (s *SQLServer) ensureTable(ctx context.Context) (err error) {
 	if err = s.lock(ctx); err != nil {
 		return err
@@ -134,29 +261,18 @@ func (s *SQLServer) ensureTable(ctx context.Context) (err error) {
 	query := fmt.Sprintf(`
 IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='%[2]s' and xtype='U')
 CREATE TABLE %[1]s.%[2]s (
-	id int IDENTITY(1,1) NOT NULL PRIMARY KEY, 
-	dispatched BIT NOT NULL default 0, 
-	dispatched_at TIMESTAMP,
-	payload VARBINARY(max)  not null,
-	options NVARCHAR(MAX),
-	headers NVARCHAR(MAX)
+	id int IDENTITY(1,1) NOT NULL PRIMARY KEY,
+	dispatched BIT NOT NULL DEFAULT 0,
+	dispatched_at DATETIME,
+	payload VARBINARY(MAX)  NOT NULL,
+	options VARBINARY(MAX),
+	headers VARBINARY(MAX)
 );
 `, s.SchemaName, s.EventStoreTable)
-	//TODO:
-	// CREATE INDEX IF NOT EXISTS "index_dispatchedAt" ON %[1]s using btree (dispatched_at asc nulls last);
-	// CREATE INDEX IF NOT EXISTS "index_dispatched" ON %[1]s using btree (dispatched asc nulls last);
 
 	if _, err = s.conn.ExecContext(ctx, query); err != nil {
 		return err
 	}
 
-	return nil
-}
-
-// Close closes the db connection
-func (s *SQLServer) Close() error {
-	if err := s.conn.Close(); err != nil {
-		return fmt.Errorf("failed to close connection: %w", err)
-	}
 	return nil
 }

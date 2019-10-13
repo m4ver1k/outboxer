@@ -21,6 +21,6 @@ func TestExampleSqlServer(t *testing.T) {
 
 	_, err = sqlserver.WithInstance(ctx, db)
 	if err != nil {
-		fmt.Println("Something wring ", err)
+		fmt.Println("Something wrong ", err)
 	}
 }
