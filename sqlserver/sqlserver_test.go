@@ -4,8 +4,10 @@ import (
 	"context"
 	"regexp"
 	"testing"
+	"time"
 
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
+	"github.com/italolelis/outboxer"
 	"github.com/italolelis/outboxer/lock"
 )
 
@@ -33,6 +35,129 @@ func TestSQLServer_WithInstance_must_return_SQLServerDataStore(t *testing.T) {
 	}
 }
 
+func TestSQLServer_should_add_message(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("an error '%s' was not expected when opening a stub database connection", err)
+	}
+	defer db.Close()
+	initDatastoreMock(t, mock)
+	ds, err := WithInstance(ctx, db)
+
+	defer ds.Close()
+
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO [test_schema].[event_store]`)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	if err := ds.Add(ctx, &outboxer.OutboxMessage{
+		Payload: []byte("test payload"),
+	}); err != nil {
+		t.Fatalf("failed to add message in the data store: %s", err)
+	}
+}
+
+func TestSQLServer_should_add_message_with_tx(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("an error '%s' was not expected when opening a stub database connection", err)
+	}
+	defer db.Close()
+	initDatastoreMock(t, mock)
+	ds, err := WithInstance(ctx, db)
+
+	defer ds.Close()
+	mock.ExpectBegin()
+	mock.ExpectExec(`SELECT (.+) from event_store`).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(regexp.QuoteMeta(`INSERT INTO [test_schema].[event_store]`)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+	fn := func(tx outboxer.ExecerContext) error {
+		_, err := tx.ExecContext(ctx, "SELECT * from event_store")
+		return err
+	}
+
+	if err := ds.AddWithinTx(ctx, &outboxer.OutboxMessage{
+		Payload: []byte("test payload"),
+	}, fn); err != nil {
+		t.Fatalf("failed to add message in the data store: %s", err)
+	}
+}
+func TestSQLServer_should_get_events(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("an error '%s' was not expected when opening a stub database connection", err)
+	}
+	defer db.Close()
+	initDatastoreMock(t, mock)
+	ds, err := WithInstance(ctx, db)
+
+	defer ds.Close()
+
+	mock.ExpectQuery(regexp.QuoteMeta(`SELECT TOP 10 * FROM [test_schema].[event_store] WHERE dispatched = 0`)).
+		WillReturnRows(sqlmock.NewRows([]string{"id", "dispatched", "dispatched_at", "payload", "options", "headers"}).
+			AddRow(1, false, time.Now(), []byte("test payload"), outboxer.DynamicValues{}, outboxer.DynamicValues{}))
+
+	msgs, err := ds.GetEvents(ctx, 10)
+	if err != nil {
+		t.Fatalf("failed to retrieve messages from the data store: %s", err)
+	}
+
+	if len(msgs) != 1 {
+		t.Fatalf("was expecting 1 message in the data store but got %d", len(msgs))
+	}
+}
+
+func TestSQLServer_should_set_as_dispatched(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("an error '%s' was not expected when opening a stub database connection", err)
+	}
+	defer db.Close()
+	initDatastoreMock(t, mock)
+	ds, err := WithInstance(ctx, db)
+
+	defer ds.Close()
+
+	mock.ExpectExec(regexp.QuoteMeta(`UPDATE [test_schema].[event_store] SET`)).
+		WithArgs(1).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	err = ds.SetAsDispatched(ctx, 1)
+	if err != nil {
+		t.Fatalf("failed to set message as dispatched: %s", err)
+	}
+
+}
+
+func TestSQLServer_should_remove_messages(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("an error '%s' was not expected when opening a stub database connection", err)
+	}
+	defer db.Close()
+	initDatastoreMock(t, mock)
+	ds, err := WithInstance(ctx, db)
+
+	defer ds.Close()
+	mock.ExpectBegin()
+	mock.ExpectExec(regexp.QuoteMeta(`DELETE FROM [test_schema].[event_store] WHERE id IN`)).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+	if err := ds.Remove(ctx, time.Now(), 10); err != nil {
+		t.Fatalf("failed to remove messages: %s", err)
+	}
+
+}
 func initDatastoreMock(t *testing.T, mock sqlmock.Sqlmock) {
 	mock.ExpectQuery(`SELECT DB_NAME() `).
 		WillReturnRows(sqlmock.NewRows([]string{"DB_NAME()"}).AddRow("test"))
