@@ -211,7 +211,7 @@ func (s *SQLServer) lock(ctx context.Context) error {
 	query := `EXEC sp_getapplock 
 	@Resource = @p1,
 	@LockOwner='Session',
-	@LockMode = 'Exclusive'; `
+	@LockMode = 'Exclusive';`
 
 	if _, err := s.conn.ExecContext(ctx, query, aid); err != nil {
 		return fmt.Errorf("try lock failed: %w", err)
@@ -234,7 +234,7 @@ func (s *SQLServer) unlock(ctx context.Context) error {
 
 	query := `EXEC sp_releaseapplock  
 	@Resource = @p1, 
-	@LockOwner='Session'; `
+	@LockOwner='Session';`
 
 	if _, err := s.conn.ExecContext(ctx, query, aid); err != nil {
 		return err
@@ -258,9 +258,8 @@ func (s *SQLServer) ensureTable(ctx context.Context) (err error) {
 		}
 	}()
 
-	query := fmt.Sprintf(`
-IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='%[2]s' and xtype='U')
-CREATE TABLE %[1]s.%[2]s (
+	query := fmt.Sprintf(
+		`IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='%[2]s' and xtype='U') CREATE TABLE %[1]s.%[2]s (
 	id int IDENTITY(1,1) NOT NULL PRIMARY KEY,
 	dispatched BIT NOT NULL DEFAULT 0,
 	dispatched_at DATETIME,
